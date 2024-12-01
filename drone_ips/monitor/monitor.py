@@ -5,9 +5,16 @@ from typing import Any, Optional
 
 import dronekit
 
+import sys
+import os
+import pandas as pd
+import numpy as np
+import time
+import joblib
+from sklearn.preprocessing import StandardScaler
+
 import drone_ips.logging as ips_logging
 import drone_ips.utils as ips_utils
-
 
 class Monitor:
     """A class for monitoring the vehicle's data stream.
@@ -29,6 +36,9 @@ class Monitor:
         self.vehicle: Optional[dronekit.Vehicle] = None
         self._data: list[dict] = []
         self.csv_writer = ips_logging.CSVLogger()
+        # Load the model once during initialization
+        model_path = "./model/one_class_svm_model.pkl"
+        self.model = self.load_model(model_path)  # Load model once
         # Set the options (silently ignore any unknown options)
         self.POLL_WHILE_DISARMED = options.get("always_poll", False)  # type: ignore
         self.POLL_INTERVAL = options.get("poll_interval", Monitor.POLL_INTERVAL)  # type: ignore
@@ -44,6 +54,98 @@ class Monitor:
         """
         return self._data[-1] if len(self._data) > 0 else None
 
+
+    def preprocess_vehicle_data(self, current_data: dict) -> np.array:
+        """Preprocess the vehicle data for prediction.
+
+        Parameters
+        ----------
+        current_data : dict
+            The current data from the vehicle.
+
+        Returns
+        -------
+        np.array
+            The preprocessed data ready for prediction.
+        """
+        # Convert the current_data dictionary to a DataFrame
+        df = pd.DataFrame([current_data])
+
+        # Feature Extraction
+        features = [ 'gps_0.eph', 'gps_0.epv',
+                    'gps_0.satellites_visible', 'location.global_frame.lat',
+                    'location.global_frame.lon', 'location.global_frame.alt',
+                    'heading' ]
+
+        # Select all columns except those in columns_to_exclude
+        df = df[features].copy()
+
+        # Convert necessary columns to numeric values to avoid type errors
+        df['location.global_frame.lat'] = pd.to_numeric(df['location.global_frame.lat'], errors='coerce')
+        df['location.global_frame.lon'] = pd.to_numeric(df['location.global_frame.lon'], errors='coerce')
+        df['location.global_frame.alt'] = pd.to_numeric(df['location.global_frame.alt'], errors='coerce')
+        df['heading'] = pd.to_numeric(df['heading'], errors='coerce')
+        df['gps_0.eph'] = pd.to_numeric(df['gps_0.eph'], errors='coerce')
+        df['gps_0.epv'] = pd.to_numeric(df['gps_0.epv'], errors='coerce')
+        df['gps_0.satellites_visible'] = pd.to_numeric(df['gps_0.satellites_visible'], errors='coerce')
+
+        # Fill NaN values which might have been created during conversion to numeric
+        df.fillna(0, inplace=True)
+
+        # Feature Engineering
+        # Calculate deltas for latitude, longitude, and altitude
+        df['delta_lat'] = df['location.global_frame.lat'].diff().fillna(0)
+        df['delta_lon'] = df['location.global_frame.lon'].diff().fillna(0)
+        df['delta_alt'] = df['location.global_frame.alt'].diff().fillna(0)
+
+        # Calculate Euclidean distance between successive GPS points
+        df['distance'] = np.sqrt(df['delta_lat']**2 + df['delta_lon']**2 + df['delta_alt']**2)
+
+        # Load the scaler
+        scaler = joblib.load("./model/scaler.pkl")
+
+        # Standardize the data using the loaded scaler
+        scaled_data = scaler.transform(df)
+
+        return scaled_data
+
+    def load_model(self, model_path: str):
+        """Load the saved ML model.
+
+        Parameters
+        ----------
+        model_path : str
+            The path to the saved model file.
+
+        Returns
+        -------
+        object
+            The loaded model.
+        """
+        return joblib.load(model_path)
+
+    def make_prediction(self, current_data: dict) -> dict:
+        """Make a prediction using the ML model.
+
+        Parameters
+        ----------
+        current_data : dict
+            The current data from the vehicle.
+
+        Returns
+        -------
+        dict
+            The prediction result.
+        """
+        # Preprocess the data
+        processed_data = self.preprocess_vehicle_data(current_data)
+
+        # Make prediction
+        prediction = self.model.predict(processed_data)
+
+        # Return the prediction result in a dictionary
+        return {'prediction': int(prediction[0])}
+
     def get_vehicle_data(self) -> dict:
         """Get the current data from the vehicle.
 
@@ -57,7 +159,13 @@ class Monitor:
         }
         current_data.update(ips_utils.misc.flatten_dict(self._get_vehicle_data_recursive(self.vehicle)))
         current_data.update(self._enriched_vehicle_data(current_data))
-        # Put the ML model here
+
+        # Make a prediction
+        prediction_result = self.make_prediction(current_data)
+
+        # Update current_data with the prediction result
+        current_data.update(prediction_result)
+
         return current_data
 
     def start(self):
